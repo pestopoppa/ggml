@@ -248,11 +248,19 @@
 typedef __hip_bfloat16 nv_bfloat16;
 typedef __hip_bfloat162 nv_bfloat162;
 
-#if HIP_VERSION >= 60200000
+// Local fix (2026-07-31, EPYC/MI210 gfx90a, ROCm 6.2.0-66): the guard below was
+// >= 60200000, but the OCP-format `__hip_fp8_e4m3` type only exists from ROCm 6.3.
+// ROCm 6.2 ships only the FNUZ variant (`__hip_fp8_e4m3_fnuz`), so on 6.2 this
+// header included hip_fp8.h and then typedef'd a type that does not exist:
+//     error: unknown type name '__hip_fp8_e4m3'
+// Raising the guard to 6.3 makes FP8 simply unavailable on 6.2, which is correct
+// and free for us: gfx90a has NO native FP8 hardware, so nothing is lost. Kernels
+// gate on FP8_AVAILABLE and fall back.
+#if HIP_VERSION >= 60300000
 #include <hip/hip_fp8.h>
 typedef __hip_fp8_e4m3 __nv_fp8_e4m3;
 #define FP8_AVAILABLE
-#endif // HIP_VERSION >= 60200000
+#endif // HIP_VERSION >= 60300000
 
 typedef int8_t int8x4_t __attribute__((ext_vector_type(4)));
 typedef uint8_t uint8x4_t __attribute__((ext_vector_type(4)));

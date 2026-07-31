@@ -166,40 +166,54 @@ static inline __device__ void ggml_cuda_swap(T & a, T & b) {
 template<ggml_sort_order order>
 static __global__ void k_argsort_f32_i32(const float * x, int * dst, const int ncols, int ncols_pad) {
     // bitonic sort
-    int col = threadIdx.x;
-    int row = blockIdx.x;
-
-    if (col >= ncols_pad) {
-        return;
-    }
+    const int row      = blockIdx.x;
+    const int nthreads = blockDim.x;
 
     const float * x_row = x + row * ncols;
     extern __shared__ int dst_row[];
 
+    // A block is capped at 1024 threads (hard limit on CDNA/gfx90a and on all
+    // supported CUDA archs), so when ncols_pad exceeds that each thread walks
+    // several columns with a stride of blockDim.x. ncols_pad and nthreads are
+    // both powers of 2 with nthreads <= ncols_pad, so every thread runs the
+    // same number of iterations and therefore reaches every __syncthreads()
+    // below the same number of times.
+    // When ncols_pad <= 1024 we have nthreads == ncols_pad and each of these
+    // loops runs exactly once with col == threadIdx.x, which is bit-identical
+    // to the original single-element-per-thread kernel.
+
     // initialize indices
-    dst_row[col] = col;
+    for (int col = threadIdx.x; col < ncols_pad; col += nthreads) {
+        dst_row[col] = col;
+    }
 
     __syncthreads();
 
     for (int k = 2; k <= ncols_pad; k *= 2) {
         for (int j = k / 2; j > 0; j /= 2) {
-            int ixj = col ^ j;
-            if (ixj > col) {
-                if ((col & k) == 0) {
-                    if (dst_row[col] >= ncols ||
-                        (dst_row[ixj] < ncols && (order == GGML_SORT_ORDER_ASC ?
-                            x_row[dst_row[col]] > x_row[dst_row[ixj]] :
-                            x_row[dst_row[col]] < x_row[dst_row[ixj]]))
-                    ) {
-                        ggml_cuda_swap(dst_row[col], dst_row[ixj]);
-                    }
-                } else {
-                    if (dst_row[ixj] >= ncols ||
-                        (dst_row[col] < ncols && (order == GGML_SORT_ORDER_ASC ?
-                            x_row[dst_row[col]] < x_row[dst_row[ixj]] :
-                            x_row[dst_row[col]] > x_row[dst_row[ixj]]))
-                    ) {
-                        ggml_cuda_swap(dst_row[col], dst_row[ixj]);
+            // At a given (k, j) stage the compare-exchange pairs (col, col^j)
+            // are disjoint and the ixj > col guard hands each pair to exactly
+            // one iteration, so no two threads touch the same dst_row slot
+            // within a stage and the strided walk needs no extra sync.
+            for (int col = threadIdx.x; col < ncols_pad; col += nthreads) {
+                const int ixj = col ^ j;
+                if (ixj > col) {
+                    if ((col & k) == 0) {
+                        if (dst_row[col] >= ncols ||
+                            (dst_row[ixj] < ncols && (order == GGML_SORT_ORDER_ASC ?
+                                x_row[dst_row[col]] > x_row[dst_row[ixj]] :
+                                x_row[dst_row[col]] < x_row[dst_row[ixj]]))
+                        ) {
+                            ggml_cuda_swap(dst_row[col], dst_row[ixj]);
+                        }
+                    } else {
+                        if (dst_row[ixj] >= ncols ||
+                            (dst_row[col] < ncols && (order == GGML_SORT_ORDER_ASC ?
+                                x_row[dst_row[col]] < x_row[dst_row[ixj]] :
+                                x_row[dst_row[col]] > x_row[dst_row[ixj]]))
+                        ) {
+                            ggml_cuda_swap(dst_row[col], dst_row[ixj]);
+                        }
                     }
                 }
             }
@@ -208,7 +222,7 @@ static __global__ void k_argsort_f32_i32(const float * x, int * dst, const int n
     }
 
     // copy the result to dst without the padding
-    if (col < ncols) {
+    for (int col = threadIdx.x; col < ncols; col += nthreads) {
         dst[row * ncols + col] = dst_row[col];
     }
 }
@@ -221,6 +235,19 @@ static int next_power_of_2(int x) {
     return n;
 }
 
+bool ggml_cuda_argsort_bitonic_supported(int64_t ncols, int device) {
+    // The block size is no longer a constraint (each thread walks several
+    // columns), so the only remaining limit is that the whole padded row has
+    // to fit in shared memory. Keep this in sync with the GGML_ASSERT in
+    // argsort_f32_i32_cuda_bitonic below -- this predicate is what stops that
+    // assert from ever being reached via supports_op.
+    if (ncols <= 0 || ncols > (1 << 30)) {
+        return false;
+    }
+    const size_t shared_mem = (size_t) next_power_of_2((int) ncols) * sizeof(int);
+    return shared_mem <= ggml_cuda_info().devices[device].smpb;
+}
+
 void argsort_f32_i32_cuda_bitonic(const float *   x,
                                   int *           dst,
                                   const int       ncols,
@@ -230,7 +257,13 @@ void argsort_f32_i32_cuda_bitonic(const float *   x,
     // bitonic sort requires ncols to be power of 2
     const int ncols_pad = next_power_of_2(ncols);
 
-    const dim3 block_dims(ncols_pad, 1, 1);
+    // A CUDA/HIP block cannot exceed 1024 threads (gfx90a enforces this hard;
+    // exceeding it makes the launch fail with "invalid argument" rather than
+    // tripping the shared-memory assert below). Cap the block and let each
+    // thread handle ncols_pad / block_size columns.
+    const int block_size = ncols_pad < 1024 ? ncols_pad : 1024;
+
+    const dim3 block_dims(block_size, 1, 1);
     const dim3 block_nums(nrows, 1, 1);
     const size_t shared_mem = ncols_pad * sizeof(int);
 
@@ -262,6 +295,17 @@ void ggml_cuda_op_argsort(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t nrows = ggml_nrows(src0);
 
     enum ggml_sort_order order = (enum ggml_sort_order) dst->op_params[0];
+
+    // Set GGML_DEBUG_ARGSORT=1 to dump the shapes this op is actually called
+    // with. getenv is evaluated once, so this costs one predicted branch per
+    // call when disabled.
+    static const bool debug_argsort = getenv("GGML_DEBUG_ARGSORT") != nullptr;
+    if (debug_argsort) {
+        fprintf(stderr, "[argsort] ne0=%lld ne1=%lld ne2=%lld ne3=%lld nrows=%lld ncols_pad=%d order=%s\n",
+                (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2],
+                (long long) src0->ne[3], (long long) nrows, next_power_of_2(ncols),
+                order == GGML_SORT_ORDER_ASC ? "ASC" : "DESC");
+    }
 
 #ifdef GGML_CUDA_USE_CUB
     const int    ncols_pad      = next_power_of_2(ncols);

@@ -5090,7 +5090,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_TOP_K:
         case GGML_OP_ARGSORT:
 #ifndef GGML_CUDA_USE_CUB
-            return op->src[0]->ne[0] <= 1024;
+            // Without CUB both ops go through the bitonic kernel, which is now
+            // limited by shared memory rather than by the 1024 threads/block cap.
+            return ggml_cuda_argsort_bitonic_supported(op->src[0]->ne[0], dev_ctx->device);
 #else
             return true;
 #endif
